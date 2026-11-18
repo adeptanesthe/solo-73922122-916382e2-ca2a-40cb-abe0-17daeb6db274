@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from . import tokenizer
 from .decoding import compare
+from .gradcheck import run_gradcheck
 from .model import get_models
 
 app = FastAPI(title="Speculative Decoding Verifier")
@@ -55,6 +56,16 @@ class DecodeRequest(BaseModel):
     prompt: str = Field(default="", max_length=200)
     k: int = Field(default=3, ge=1, le=4)
     max_new: int = Field(default=32, ge=1, le=32)
+
+
+class GradCheckRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=24)
+    next_char: str = Field(min_length=1, max_length=1)
+    block: int = Field(ge=1, le=4)
+
+
+def _is_printable_ascii(text: str) -> bool:
+    return all(0x20 <= ord(ch) <= 0x7E for ch in text)
 
 
 def _token_view(ids: list[int]) -> list[dict]:
@@ -123,6 +134,33 @@ def decode(req: DecodeRequest) -> JSONResponse:
 def presets() -> dict:
     """返回固定的两条预设（由测试套件锁定其判定类型，避免请求时全量扫描）。"""
     return {"reject": PRESET_REJECT, "all_accepted": PRESET_ALL_ACCEPTED}
+
+
+@app.post("/api/gradcheck")
+def gradcheck(req: GradCheckRequest) -> JSONResponse:
+    """梯度核对：float64 下比较自动求导与中心差分。
+
+    全部计算在独立模型副本上进行，不影响在线解码的权重、KV 缓存与
+    前向计数；计算中断时返回错误，绝不下发通过结论。
+    """
+    if not _is_printable_ascii(req.prompt):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "提示词须为 1～24 个可打印 ASCII 字符。"},
+        )
+    if not _is_printable_ascii(req.next_char):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "下一字符须为单个可打印 ASCII 字符。"},
+        )
+    try:
+        result = run_gradcheck(req.prompt, req.next_char, req.block - 1)
+    except Exception as exc:  # noqa: BLE001  # 核对中断必须兜底：明确报错，绝不返回通过结论
+        return JSONResponse(
+            status_code=500,
+            content={"status": "ERROR", "error": f"梯度核对中断：{exc!r}"},
+        )
+    return JSONResponse(result)
 
 
 @app.get("/")

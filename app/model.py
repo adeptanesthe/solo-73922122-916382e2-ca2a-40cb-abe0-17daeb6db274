@@ -125,12 +125,18 @@ class CausalTransformer(nn.Module):
                 attn_mask = None
             else:
                 # 多 token 增量：历史部分全可见，新 token 之间走因果遮挡
-                left = torch.zeros(T, past_len)
-                right = torch.triu(torch.full((T, T), float("-inf")), diagonal=1)
+                # 掩码 dtype 必须跟随 x：float64 下若仍为 float32，
+                # SDPA 反向会算错 q 的梯度（梯度核对曾在此判负并定位到此）
+                left = torch.zeros(T, past_len, dtype=x.dtype, device=x.device)
+                right = torch.triu(torch.full((T, T), float("-inf"),
+                                              dtype=x.dtype, device=x.device),
+                                   diagonal=1)
                 attn_mask = torch.cat([left, right], dim=1)
         else:
-            # 无缓存整序列：完整因果三角遮挡
-            attn_mask = torch.triu(torch.full((T, T), float("-inf")), diagonal=1)
+            # 无缓存整序列：完整因果三角遮挡（dtype 同上，须跟随 x）
+            attn_mask = torch.triu(torch.full((T, T), float("-inf"),
+                                              dtype=x.dtype, device=x.device),
+                                   diagonal=1)
 
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         out = out.transpose(1, 2).contiguous().view(B, T, self.d_model)
@@ -226,6 +232,18 @@ def get_models() -> tuple[CausalTransformer, CausalTransformer]:
     if _TARGET is None:
         _DRAFT, _TARGET = _build_pair()
     return _DRAFT, _TARGET
+
+
+def build_target_copy() -> CausalTransformer:
+    """构建一份全新的目标模型独立副本（固定种子，权重与单例逐位一致）。
+
+    供梯度核对等需要反向传播/临时改权的场景使用：副本与进程内单例
+    不共享任何张量，对副本的读写不会影响在线解码的权重、KV 缓存与
+    前向计数。fork_rng 保证构建过程不扰动全局随机数流。
+    """
+    with torch.random.fork_rng():
+        _, target = _build_pair()
+    return target
 
 
 def greedy_argmax(logits: torch.Tensor) -> int:

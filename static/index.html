@@ -25,7 +25,7 @@
     border-radius: 10px; padding: 18px; margin-bottom: 20px;
   }
   label { display: block; color: var(--muted); margin-bottom: 6px; font-size: 12px; }
-  textarea, input[type=number] {
+  textarea, input[type=number], input[type=text], select {
     width: 100%; background: #0c1116; color: var(--txt);
     border: 1px solid var(--line); border-radius: 6px; padding: 10px;
     font-family: inherit; font-size: 14px;
@@ -74,6 +74,9 @@
   .hidden { display: none; }
   .err { color: var(--bad); margin-top: 10px; }
   .savings-big { font-size: 26px; font-weight: 800; color: var(--ok); }
+  .badge.error { background: rgba(224,161,60,.18); color: var(--warn); border: 1px solid var(--warn); }
+  td.bad-coord { background: rgba(255,92,92,.14); color: #ffc4c4; }
+  .hint { color: var(--muted); font-size: 12px; margin: 0 0 12px; }
 </style>
 </head>
 <body>
@@ -155,6 +158,68 @@
           </tr>
         </thead>
         <tbody id="roundBody"></tbody>
+      </table>
+    </section>
+  </section>
+
+  <section class="panel">
+    <h3>梯度核对（float64 · 自动求导 vs 中心差分）</h3>
+    <p class="hint">以「已知下一字符」的负对数似然为损失，在独立的 float64 模型副本上比较自动求导与中心差分：
+      所选块的 Q/K/V 投影各取 2 个固定坐标，提示词字符对应的绑定词嵌入/输出权重取 2 个坐标
+      （扰动同时作用于输入与输出两条路径）。任一坐标绝对误差 &gt; 1e-5 即判失败；
+      核对不影响在线解码的权重、KV 缓存与前向计数。</p>
+    <div class="row">
+      <div style="flex:3">
+        <label for="gcPrompt">提示词（1～24 个可打印 ASCII 字符）</label>
+        <input type="text" id="gcPrompt" maxlength="24" value="hello world" />
+      </div>
+      <div>
+        <label for="gcNext">已知下一字符</label>
+        <input type="text" id="gcNext" maxlength="1" value="!" />
+      </div>
+      <div>
+        <label for="gcBlock">目标块（共 4 块）</label>
+        <select id="gcBlock">
+          <option value="1">块 1</option>
+          <option value="2" selected>块 2</option>
+          <option value="3">块 3</option>
+          <option value="4">块 4</option>
+        </select>
+      </div>
+      <div style="display:flex;align-items:flex-end">
+        <button id="gcRun">运行梯度核对</button>
+      </div>
+    </div>
+    <div class="err hidden" id="gcErr"></div>
+  </section>
+
+  <section id="gcResult" class="hidden">
+    <section class="panel">
+      <span id="gcBadge" class="badge pass">PASS</span>
+      <span style="color:var(--muted);margin-left:10px" id="gcStatusText"></span>
+      <div id="gcFailNote" class="mismatch-note hidden"></div>
+      <div class="grid2" style="margin-top:12px">
+        <div>
+          <div class="metric"><span>损失（下一字符 NLL，float64）</span><b id="gcLoss">-</b></div>
+          <div class="metric"><span>最大绝对误差</span><b id="gcMaxErr">-</b></div>
+        </div>
+        <div>
+          <div class="metric"><span>中心差分扰动 h</span><b id="gcEps">-</b></div>
+          <div class="metric"><span>判定阈值</span><b id="gcTol">-</b></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h3>逐坐标对照（8 项）</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>参数</th><th>坐标</th><th>自动求导</th><th>中心差分</th>
+            <th>绝对误差</th><th>说明</th>
+          </tr>
+        </thead>
+        <tbody id="gcBody"></tbody>
       </table>
     </section>
   </section>
@@ -299,6 +364,102 @@ function render(d) {
 }
 
 loadPresets();
+
+/* ---------------- 梯度核对 ---------------- */
+
+function fmtSci(v, digits) {
+  if (v === 0) return "0";
+  return Number(v).toExponential(digits);
+}
+
+$("gcRun").onclick = async () => {
+  $("gcErr").classList.add("hidden");
+  $("gcResult").classList.add("hidden");  // 先收起旧结论，中断时绝不残留 PASS
+  const prompt = $("gcPrompt").value;
+  const nextChar = $("gcNext").value;
+  const showErr = (msg) => {
+    $("gcErr").textContent = msg;
+    $("gcErr").classList.remove("hidden");
+  };
+  if (prompt.length < 1 || prompt.length > 24) {
+    showErr("提示词须为 1～24 个字符。");
+    return;
+  }
+  if (nextChar.length !== 1) {
+    showErr("已知下一字符须恰好为 1 个字符。");
+    return;
+  }
+  let data, ok;
+  try {
+    const r = await fetch("/api/gradcheck", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        prompt: prompt,
+        next_char: nextChar,
+        block: parseInt($("gcBlock").value, 10),
+      }),
+    });
+    ok = r.ok;
+    data = await r.json();
+  } catch (e) {
+    showErr("梯度核对中断：" + String(e) + "（未得出通过结论）");
+    return;
+  }
+  if (!ok || !data || (data.status !== "PASS" && data.status !== "FAIL")) {
+    // 计算中断或响应异常：只报错，绝不显示通过结论
+    showErr("梯度核对中断：" + (data && data.error ? data.error : "服务返回异常")
+      + "（未得出通过结论）");
+    return;
+  }
+  renderGradcheck(data);
+};
+
+function renderGradcheck(d) {
+  $("gcResult").classList.remove("hidden");
+  const pass = d.status === "PASS";
+  const badge = $("gcBadge");
+  badge.textContent = d.status;
+  badge.className = "badge " + (pass ? "pass" : "fail");
+  $("gcStatusText").textContent = pass
+    ? "全部 8 个坐标的自动求导与中心差分一致（误差 ≤ 1e-5），反传梯度可靠"
+    : "存在超过阈值的坐标，判定失败";
+
+  const note = $("gcFailNote");
+  if (pass || !d.first_failure) {
+    note.classList.add("hidden");
+  } else {
+    note.classList.remove("hidden");
+    const f = d.first_failure;
+    note.innerHTML = "首个超差坐标：<b>" + f.name + "</b> [" + f.row + "," + f.col
+      + "]，绝对误差 <b>" + fmtSci(f.abs_error, 4) + "</b> &gt; 1e-5";
+  }
+
+  $("gcLoss").textContent = Number(d.loss).toPrecision(12);
+  $("gcMaxErr").textContent = fmtSci(d.max_abs_error, 4);
+  $("gcEps").textContent = fmtSci(d.fd_eps, 1);
+  $("gcTol").textContent = fmtSci(d.tolerance, 1);
+
+  const body = $("gcBody");
+  body.innerHTML = "";
+  d.entries.forEach((e) => {
+    const bad = e.abs_error > d.tolerance;
+    const tr = document.createElement("tr");
+    [
+      e.name,
+      "[" + e.row + "," + e.col + "]",
+      fmtSci(e.autodiff, 8),
+      fmtSci(e.finite_diff, 8),
+      fmtSci(e.abs_error, 4),
+      e.note || "",
+    ].forEach((txt, i) => {
+      const td = document.createElement("td");
+      td.textContent = txt;
+      if (bad && i === 4) td.className = "bad-coord";
+      tr.appendChild(td);
+    });
+    body.appendChild(tr);
+  });
+}
 </script>
 </body>
 </html>
